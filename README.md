@@ -1,75 +1,126 @@
-# Excel Import Pipeline
+# Excel Import Pipeline: 5-Million-Record CSV Processing Design
 
-The project also includes a standalone Express API for converting an uploaded `.xlsx` workbook to JSON and issuing presigned CSV upload URLs.
+An AWS CDK application for importing `.xlsx` workbooks and `.csv` files into DynamoDB. It includes an Express API that creates presigned URLs for browser-based CSV uploads.
+
+## Import Paths
+
+- **XLSX:** S3 upload event -> Step Functions -> workbook loader -> validation and persistence SQS queues -> DynamoDB.
+- **CSV:** S3 upload event -> Step Functions Distributed Map -> batched CSV validation and persistence -> DynamoDB.
+
+Both paths validate records against the shared Zod schema. Invalid XLSX rows are stored in DynamoDB; invalid CSV rows are written to private error files in S3. Completion summaries are sent through Amazon SES.
+
+The XLSX loader buffers the workbook in Lambda memory. The CSV path reads rows from S3 in bounded batches and is intended for larger files. The configured five-million-row CSV target has **not been load-tested** and is not a production throughput guarantee.
 
 ## Documentation
 
-- [Lambda pipeline architecture](PIPELINE_ARCHITECTURE.md): component map, handler responsibilities, data flow, AWS resources, and failure behavior.
-- [Large CSV processing](LARGE_CSV_SCALING.md): implemented 5-million-row CSV design, Zod rules, configuration, and untested capacity limits.
-- [AWS setup and deployment](docs/AWS_DEPLOYMENT.md): account access, CDK bootstrap, deployment, upload, and monitoring steps.
-- [Step Functions workflow](docs/STEP_FUNCTIONS.md): file routing, execution details, and troubleshooting.
+- [Pipeline architecture](docs/PIPELINE_ARCHITECTURE.md): components, data flow, handlers, and failure behavior.
+- [Large CSV scaling](docs/LARGE_CSV_SCALING.md): batching design, limits, cost considerations, and load-testing guidance.
+- [AWS setup and deployment](docs/AWS_DEPLOYMENT.md): credentials, SES setup, CDK bootstrap, deployment, and monitoring.
+- [Step Functions workflow](docs/STEP_FUNCTIONS.md): file routing, execution behavior, and troubleshooting.
 
-## Express Excel-to-JSON API
+## Requirements
+
+- Node.js 22 and npm.
+- For AWS deployment: AWS CLI credentials with permission to deploy the stack, and a CDK-bootstrapped account and Region.
+- A verified SES sender address and recipient address in the deployment Region. In SES sandbox mode, recipients must also be verified.
+
+## Install and Run the Express API
+
+Install dependencies and start the local API:
 
 ```sh
 npm install
 npm run dev
 ```
 
-The API listens on `http://localhost:3000` by default. Send the workbook bytes directly as the request body:
+The API listens on `http://localhost:3000` by default. `GET /health` returns a health status.
+
+The API provides `POST /uploads/presign` to create a five-minute presigned S3 upload URL for a CSV file. It expects JSON containing a `.csv` filename:
 
 ```sh
-curl -X POST http://localhost:3000/convert \
-	-H 'Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' \
-	--data-binary @workbook.xlsx
+curl -X POST http://localhost:3000/uploads/presign \
+  -H 'Content-Type: application/json' \
+  -d '{"filename":"records.csv"}'
 ```
 
-The response contains the first worksheet name, row count, and JSON records. The first row supplies the property names; uploads are limited to 10 MB. `GET /health` checks whether the service is running.
+The response includes `uploadUrl`, the generated S3 `key`, and the required `Content-Type` header. Upload the CSV bytes to that URL with an HTTP `PUT`, using the returned headers.
 
-The AWS CDK pipeline supports two import paths:
+Configure the local API with these environment variables:
 
-- `.xlsx`: `S3 -> Step Functions -> LoadWorkbook -> validation SQS -> ValidateRows -> persistence SQS -> PersistRows -> DynamoDB`
-- `.csv`: `S3 -> Step Functions Distributed Map -> batched ProcessCsvBatch Lambda -> DynamoDB`, with per-chunk error CSVs in S3
+- `UPLOADS_BUCKET`: deployed upload bucket name; required for presigning.
+- `PORT`: API port; defaults to `3000`.
+- `CORS_ORIGIN`: allowed browser origin; defaults to `*`.
 
-Both paths validate `name`, `email`, `contact number`, and `address` with a shared Zod schema before writing valid records. Invalid XLSX rows are recorded in DynamoDB; invalid large-CSV rows are written to S3 error parts. Completion summaries are emailed through SES.
+The API uses the AWS SDK credential provider chain for S3 access. It does not automatically load `.env` files. For example, with an AWS CLI profile:
 
-## Workbook format
+```sh
+export AWS_PROFILE=excel-import-dev
+export UPLOADS_BUCKET=UPLOAD_BUCKET_NAME
+npm run dev
+```
 
-Upload an `.xlsx` or `.csv` file to the generated upload bucket. The header row must contain `name`, `email`, `contact number`, and `address`. Zod requires non-empty name/address, a valid email, and a contact number containing 7-15 digits; contact numbers are stored as text and may include `+`, spaces, parentheses, periods, and hyphens.
+A successful `PUT` to the upload bucket starts the import automatically through the S3 object-created notification. The browser upload flow supports CSV files; upload XLSX files directly to S3 or use another S3 upload client.
 
-## Deploy
+## Input Format and Validation
 
-Prerequisites: Node.js 22, AWS CLI credentials, an AWS CDK-bootstrapped account/region, and verified sender/recipient email identities in SES. SES sandbox accounts can send only to verified recipients.
+The first row must contain these columns:
+
+```text
+name,email,contact number,address
+```
+
+CSV header names are trimmed and compared without regard to case. XLSX processing reads the first worksheet and applies the same header normalization.
+
+Validation rules:
+
+- `name` and `address` must not be empty after trimming.
+- `email` must be a valid email address.
+- `contact number` is stored as text. It may contain a leading `+`, digits, spaces, parentheses, periods, and hyphens, and must contain 7 to 15 digits.
+
+Update [record-schema.ts](lambda/lib/record-schema.ts) if the business validation rules change.
+
+## AWS Deployment
+
+Use the organization's approved AWS access method. The detailed setup is in [AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md). A typical deployment sequence is:
 
 ```sh
 npm install
 npm run build
-npx cdk bootstrap aws://ACCOUNT_ID/REGION
-npx cdk deploy --parameters ExcelImportPipeline:NotificationEmail=recipient@example.com --parameters ExcelImportPipeline:SesFromEmail=verified-sender@example.com
+npx cdk synth
+npx cdk bootstrap aws://ACCOUNT_ID/REGION --profile excel-import-dev
+npx cdk deploy --profile excel-import-dev \
+  --parameters ExcelImportPipeline:NotificationEmail=recipient@example.com \
+  --parameters ExcelImportPipeline:SesFromEmail=verified-sender@example.com
 ```
 
-The deployment outputs the upload bucket name, jobs table name, and state machine ARN. Uploading an `.xlsx` or `.csv` object starts a job. The notification recipient and sender are stack parameters.
+Replace the account, Region, profile, and email placeholders with your deployment values. The sender and recipient must be verified in SES in the deployment Region.
 
-To upload a CSV from a browser, run the Express service with AWS credentials and `UPLOADS_BUCKET` set to the deployed upload bucket name. Request a URL, then `PUT` the file bytes to it using the returned `Content-Type` header. The S3 object-created event starts the import automatically:
+The stack outputs the upload bucket name, jobs table name, and state machine ARN. Upload a supported file to the upload bucket to start processing:
 
-```js
-const { uploadUrl, headers } = await fetch(
-  "http://localhost:3000/uploads/presign",
-  {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filename: file.name }),
-  },
-).then((response) => response.json());
-
-await fetch(uploadUrl, { method: "PUT", headers, body: file });
+```sh
+aws s3 cp ./records.csv s3://UPLOAD_BUCKET_NAME/records.csv \
+  --profile excel-import-dev
 ```
 
-CSV files must have a header row containing `name`, `email`, `contact number`, and `address`. The Distributed Map CSV path is configured for batches of at most 1,000 rows or 128 KiB, with concurrency capped at 100. Five-million-row capacity has not yet been load-tested. The XLSX path still buffers the workbook in Lambda memory.
+Use a lowercase `.csv` or `.xlsx` suffix so the S3 notification routes the object to the workflow.
 
-## Notes
+## CSV Capacity and Operational Notes
 
-- This example loads the workbook into Lambda memory and sends one SQS message per row. For very large workbooks, replace the loader with an S3-backed streaming/chunking design; the 15-minute Lambda limit and SQS message/throughput limits apply.
-- SQS consumers use partial batch responses and dead-letter queues. Inspect the DLQs and job table for rows that exhaust retries.
-- DynamoDB tables and buckets are retained when the stack is deleted. Review data retention and access policies before production use.
-- Completion email delivery uses SES and must be permitted by the account's sending limits and region configuration.
+The CSV Distributed Map is configured for up to 1,000 rows or 128 KiB per batch, with maximum concurrency of 100. Each CSV object must be no larger than the Step Functions S3 ItemReader limit of 10 GB. The five-million-row target has not been load-tested; test with representative files and monitor duration, failures, throttling, and cost before production use.
+
+Records are stored as individual DynamoDB items. Invalid CSV rows are stored as per-chunk CSV files in the private reports bucket, and the completion email links to a manifest. Downloading the report files requires AWS access to that bucket.
+
+For XLSX files, a successful Step Functions execution means the workbook loader finished and queued rows. Validation and persistence continue asynchronously through SQS, so check the job status and queues separately.
+
+The S3 buckets and DynamoDB tables use retain policies. Destroying the CDK stack does not automatically delete those resources or their data. Review retention, access, monitoring, and recovery procedures before production use.
+
+## Project Commands
+
+```sh
+npm run dev      # Run the local Express API with ts-node
+npm start        # Run the compiled API from dist/server.js
+npm run build    # TypeScript build
+npm test         # Run Jest tests
+npm run synth    # Build and synthesize the CDK stack
+npm run deploy   # Build and deploy the CDK stack
+```
