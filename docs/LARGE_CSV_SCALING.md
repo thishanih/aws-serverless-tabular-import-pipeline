@@ -6,15 +6,12 @@ The CDK stack now routes CSV uploads through an S3-backed Step Functions Distrib
 
 ## Why the Current Loader Does Not Scale
 
-The original [LoadWorkbook handler](lambda/handlers/load-workbook.ts) downloads the full S3 object into a `Buffer`, parses it into an ExcelJS workbook, creates an in-memory message for every data row, and sends SQS batches sequentially. That remains the `.xlsx` path and should only be used for supported workbook sizes. The scalable CSV path bypasses ExcelJS and reads CSV rows directly from S3 with a Distributed Map.
-
-The XLSX loader is configured for 2 GB of memory and a 15-minute timeout. Increasing memory alone would not solve the unbounded arrays or sequential enqueueing for a multi-million-row CSV.
+CSV rows are read directly from S3 with a Distributed Map and processed in bounded batches, avoiding whole-file buffering and per-row queue messages.
 
 ## Architecture
 
 S3 remains the upload point and `StartWorkflow` remains the event entry point. `ImportWorkflow` branches on the object key:
 
-- `.xlsx`: `LoadWorkbook` parses the workbook and uses the existing validation and persistence SQS path.
 - `.csv`: `CreateCsvJob` initializes job metadata, then a Step Functions **Distributed Map** reads rows directly from S3 and invokes `ProcessCsvBatch` with bounded batches.
 
 ```mermaid
@@ -37,13 +34,6 @@ flowchart LR
     ErrorPart --> Finalize
     Finalize --> Job[(Jobs totals and status)]
     Finalize --> Email[SES completion email]
-    Choice -->|XLSX| Loader[LoadWorkbook Lambda]
-    Loader --> VQ[Validation SQS]
-    VQ --> Validate[ValidateRows Lambda]
-    Validate -->|Valid| PQ[Persistence SQS]
-    Validate -->|Invalid| Errors[(ValidationErrors table)]
-    PQ --> Persist[PersistRows Lambda]
-    Persist --> Records
 ```
 
 The Map Run does not create one child execution per CSV row. `ItemBatcher` groups rows, and each Express child invokes the worker once per batch. With 1,000 rows per batch, 5 million rows require about 5,000 child executions; the 128 KiB byte cap can create smaller batches for larger rows.
@@ -51,7 +41,7 @@ The Map Run does not create one child execution per CSV row. `ItemBatcher` group
 ## Processing Design
 
 1. **Upload:** Put the CSV in the private upload bucket. Its first row must contain `name,email,contact number,address`. The object is processed as one job.
-2. **Select the path:** `StartWorkflow` starts a Standard execution with the bucket, key, and job ID. `ImportWorkflow` selects the CSV branch by `.csv` key suffix; XLSX files continue through the existing loader.
+2. **Start the workflow:** `StartWorkflow` starts a Standard execution with the bucket, key, and job ID for each uploaded `.csv` object.
 3. **Initialize:** `CreateCsvJob` idempotently creates the `Jobs` item with status `PROCESSING` and the source key. Total rows are counted from completed chunk summaries after the Map Run.
 4. **Read and batch:** `S3CsvItemReader` reads the object with `CSVHeaderLocation: FIRST_ROW`. The source bucket and state machine must be in the same account and Region. `ItemBatcher` is configured for at most 1,000 rows and 128 KiB per child input.
 5. **Validate before database writes:** `ProcessCsvBatch` maps the exact `contact number` CSV header to `contactNumber` and runs the shared Zod schema for every row in the batch before writing any valid rows to `Records`.
@@ -91,7 +81,6 @@ The CSV branch, Zod validation, chunk summaries, part files, finalizer, and Resu
 - Confirm the CSV object is no larger than Step Functions' 10 GB ItemReader limit. The current implementation does not split oversized inputs into multiple objects.
 - Review DynamoDB cost and decide whether 5 million individual `Records` items are required or whether validated output should instead be partitioned in S3.
 - Define monitoring/alarms and a retry/recovery procedure for failed Map Runs and dead-letter queues.
-- The `.xlsx` path still buffers the entire workbook through ExcelJS and is not covered by the multi-million-row CSV design.
 
 ## References
 

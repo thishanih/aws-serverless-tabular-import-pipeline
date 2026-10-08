@@ -3,14 +3,12 @@ import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as iam from "aws-cdk-lib/aws-iam";
-import * as events from "aws-cdk-lib/aws-lambda-event-sources";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3n from "aws-cdk-lib/aws-s3-notifications";
 import * as sfn from "aws-cdk-lib/aws-stepfunctions";
 import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
-import * as sqs from "aws-cdk-lib/aws-sqs";
 
 export class PipelineStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -61,14 +59,6 @@ export class PipelineStack extends cdk.Stack {
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
-    const errors = new dynamodb.Table(this, "ValidationErrors", {
-      partitionKey: { name: "jobId", type: dynamodb.AttributeType.STRING },
-      sortKey: { name: "rowNumber", type: dynamodb.AttributeType.NUMBER },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      encryption: dynamodb.TableEncryption.AWS_MANAGED,
-      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
     const chunkSummaries = new dynamodb.Table(this, "CsvChunkSummaries", {
       partitionKey: { name: "jobShard", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "chunkId", type: dynamodb.AttributeType.STRING },
@@ -78,39 +68,12 @@ export class PipelineStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    const validationDlq = new sqs.Queue(this, "ValidationDLQ", {
-      retentionPeriod: cdk.Duration.days(14),
-    });
-    const persistenceDlq = new sqs.Queue(this, "PersistenceDLQ", {
-      retentionPeriod: cdk.Duration.days(14),
-    });
-    const validationQueue = new sqs.Queue(this, "ValidationQueue", {
-      visibilityTimeout: cdk.Duration.minutes(3),
-      deadLetterQueue: { queue: validationDlq, maxReceiveCount: 5 },
-    });
-    const persistenceQueue = new sqs.Queue(this, "PersistenceQueue", {
-      visibilityTimeout: cdk.Duration.minutes(3),
-      deadLetterQueue: { queue: persistenceDlq, maxReceiveCount: 5 },
-    });
-
     const common = {
       runtime: lambda.Runtime.NODEJS_22_X,
       timeout: cdk.Duration.minutes(2),
       memorySize: 512,
       bundling: { minify: true, sourceMap: true },
     };
-    const loader = new NodejsFunction(this, "LoadWorkbook", {
-      ...common,
-      entry: path.join(__dirname, "../lambda/handlers/load-workbook.ts"),
-      handler: "handler",
-      timeout: cdk.Duration.minutes(15),
-      memorySize: 2048,
-      environment: {
-        JOBS_TABLE: jobs.tableName,
-        VALIDATION_QUEUE_URL: validationQueue.queueUrl,
-        UPLOADS_BUCKET: uploads.bucketName,
-      },
-    });
     const createCsvJob = new NodejsFunction(this, "CreateCsvJob", {
       ...common,
       entry: path.join(__dirname, "../lambda/handlers/create-csv-job.ts"),
@@ -202,17 +165,9 @@ export class PipelineStack extends cdk.Stack {
         payloadResponseOnly: true,
       },
     );
-    const loadWorkbookTask = new tasks.LambdaInvoke(this, "CreateBatches", {
-      lambdaFunction: loader,
-      payloadResponseOnly: true,
-      retryOnServiceExceptions: true,
-    });
-    const definition = new sfn.Choice(this, "SelectFileProcessingPath")
-      .when(
-        sfn.Condition.stringMatches("$.key", "*.csv"),
-        sfn.Chain.start(createCsvJobTask).next(csvMap).next(finalizeCsvJobTask),
-      )
-      .otherwise(loadWorkbookTask);
+    const definition = sfn.Chain.start(createCsvJobTask)
+      .next(csvMap)
+      .next(finalizeCsvJobTask);
     const machine = new sfn.StateMachine(this, "ImportWorkflow", {
       definitionBody: sfn.DefinitionBody.fromChainable(definition),
       timeout: cdk.Duration.hours(6),
@@ -228,43 +183,10 @@ export class PipelineStack extends cdk.Stack {
       s3.EventType.OBJECT_CREATED,
       new s3n.LambdaDestination(start),
       {
-        suffix: ".xlsx",
-      },
-    );
-    uploads.addEventNotification(
-      s3.EventType.OBJECT_CREATED,
-      new s3n.LambdaDestination(start),
-      {
         suffix: ".csv",
       },
     );
 
-    const handlerEnvironment = {
-      JOBS_TABLE: jobs.tableName,
-      ERRORS_TABLE: errors.tableName,
-      REPORTS_BUCKET: reports.bucketName,
-      NOTIFICATION_EMAIL: notificationEmail.valueAsString,
-      SES_FROM_EMAIL: sesFromEmail.valueAsString,
-    };
-    const validator = new NodejsFunction(this, "ValidateRows", {
-      ...common,
-      entry: path.join(__dirname, "../lambda/handlers/validate-row.ts"),
-      handler: "handler",
-      environment: {
-        ...handlerEnvironment,
-        RECORDS_QUEUE_URL: persistenceQueue.queueUrl,
-      },
-    });
-    const writer = new NodejsFunction(this, "PersistRows", {
-      ...common,
-      entry: path.join(__dirname, "../lambda/handlers/persist-row.ts"),
-      handler: "handler",
-      environment: { ...handlerEnvironment, RECORDS_TABLE: records.tableName },
-    });
-
-    uploads.grantRead(loader);
-    jobs.grantReadWriteData(loader);
-    validationQueue.grantSendMessages(loader);
     jobs.grantWriteData(createCsvJob);
     records.grantWriteData(processCsvBatch);
     chunkSummaries.grantReadWriteData(processCsvBatch);
@@ -273,34 +195,10 @@ export class PipelineStack extends cdk.Stack {
     chunkSummaries.grantReadData(finalizeCsvJob);
     reports.grantPut(finalizeCsvJob);
     reports.grantRead(finalizeCsvJob);
-    jobs.grantReadWriteData(validator);
-    errors.grantReadWriteData(validator);
-    persistenceQueue.grantSendMessages(validator);
-    jobs.grantReadWriteData(writer);
-    records.grantReadWriteData(writer);
-    errors.grantReadData(writer);
-    reports.grantPut(writer);
-    reports.grantRead(writer);
-    reports.grantPut(validator);
-    reports.grantRead(validator);
-    for (const fn of [validator, writer, finalizeCsvJob]) {
-      fn.addToRolePolicy(
-        new iam.PolicyStatement({
-          actions: ["ses:SendEmail"],
-          resources: ["*"],
-        }),
-      );
-    }
-    validator.addEventSource(
-      new events.SqsEventSource(validationQueue, {
-        batchSize: 10,
-        reportBatchItemFailures: true,
-      }),
-    );
-    writer.addEventSource(
-      new events.SqsEventSource(persistenceQueue, {
-        batchSize: 10,
-        reportBatchItemFailures: true,
+    finalizeCsvJob.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["ses:SendEmail"],
+        resources: ["*"],
       }),
     );
 

@@ -4,7 +4,7 @@ This guide deploys the `ExcelImportPipeline` CDK stack to an AWS account and reg
 
 ## What the Stack Creates
 
-The stack provisions upload and report S3 buckets, Lambda functions, a Step Functions state machine, an S3-backed Distributed Map for CSVs, SQS queues and dead-letter queues for XLSX rows, DynamoDB tables including sharded CSV chunk summaries, and SES email integration.
+The stack provisions upload and report S3 buckets, Lambda functions, a Step Functions state machine, an S3-backed Distributed Map for CSVs, DynamoDB tables including sharded CSV chunk summaries, and SES email integration.
 
 ## Prerequisites
 
@@ -75,7 +75,7 @@ npx cdk deploy --profile excel-import-dev \
   --parameters ExcelImportPipeline:SesFromEmail=verified-sender@example.com
 ```
 
-Review the proposed changes and approve the deployment when prompted. The stack injects table names, queue URLs, bucket names, and the state machine ARN into the relevant Lambda functions. Do not copy the placeholder Lambda values from `.env.example` into AWS.
+Review the proposed changes and approve the deployment when prompted. The stack injects table names, bucket names, and the state machine ARN into the relevant Lambda functions. Do not copy the placeholder Lambda values from `.env.example` into AWS.
 
 When deployment completes, save the `UploadBucketName`, `JobsTableName`, and `StateMachineArn` outputs. You can display the stack outputs again with:
 
@@ -87,18 +87,11 @@ aws cloudformation describe-stacks \
   --output table
 ```
 
-## 6. Upload a Workbook
+## 6. Upload a CSV
 
-The simplest test is uploading a workbook directly to the output upload bucket:
+Replace `UPLOAD_BUCKET_NAME` with the `UploadBucketName` stack output. The first row must contain `name`, `email`, `contact number`, and `address` headers. Only lowercase `.csv` objects start the workflow; other file types are ignored by the S3 notification. CSV files use the S3-backed Distributed Map and batched Zod validation. The 5-million-row CSV target has not been load-tested, and one CSV object must be within the 10 GB Step Functions ItemReader limit.
 
-```sh
-aws s3 cp ./workbook.xlsx s3://UPLOAD_BUCKET_NAME/workbook.xlsx \
-  --profile excel-import-dev
-```
-
-Replace `UPLOAD_BUCKET_NAME` with the `UploadBucketName` stack output. The first row must contain `name`, `email`, `contact number`, and `address` headers. The S3 event starts Step Functions. XLSX files use the buffered loader and SQS path; CSV files use the S3-backed Distributed Map and batched Zod validation. The 5-million-row CSV target has not been load-tested, and one CSV object must be within the 10 GB Step Functions ItemReader limit.
-
-For a direct S3 CSV upload:
+For a direct S3 upload:
 
 ```sh
 aws s3 cp ./records.csv s3://UPLOAD_BUCKET_NAME/records.csv \
@@ -118,10 +111,9 @@ The browser requests `POST http://localhost:3000/uploads/presign`, then uploads 
 ## 7. Monitor an Import
 
 - In Step Functions, find the state machine using the `StateMachineArn` output and inspect executions, the CSV Map Run, and task failures.
-- In Lambda, inspect logs for `StartWorkflow`, `LoadWorkbook`, `ProcessCsvBatch`, and `FinalizeCsvJob` as appropriate.
-- XLSX processing continues asynchronously through the validation and persistence queues; check both queues, their DLQs, and the `Jobs`, `Records`, and `ValidationErrors` tables.
+- In Lambda, inspect logs for `StartWorkflow`, `ProcessCsvBatch`, and `FinalizeCsvJob`.
 - CSV job totals are aggregated after the Map Run succeeds. Invalid CSV rows are stored as per-chunk CSVs in the private reports bucket; the email links to a manifest of those objects. Downloading the listed parts requires AWS access to the bucket.
-- Completion emails are sent through SES. The existing XLSX error report link expires after seven days; the CSV manifest link also expires after seven days.
+- Completion emails are sent through SES. The CSV manifest link expires after seven days.
 
 ## Update or Remove the Stack
 

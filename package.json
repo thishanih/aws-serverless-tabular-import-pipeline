@@ -13,7 +13,7 @@
     "deploy": "npm run build && cdk deploy"
   },
   "license": "ISC",
-  "description": "Excel import pipeline using S3, Step Functions, SQS, Lambda, and DynamoDB",
+  "description": "CSV import pipeline using S3, Step Functions, Lambda, and DynamoDB",
   "devDependencies": {
     "@types/aws-lambda": "^8.10.150",
     "@types/cors": "^2.8.19",
@@ -35,11 +35,9 @@
     "@aws-sdk/client-s3": "^3.775.0",
     "@aws-sdk/client-sesv2": "^3.775.0",
     "@aws-sdk/client-sfn": "^3.775.0",
-    "@aws-sdk/client-sqs": "^3.775.0",
     "@aws-sdk/lib-dynamodb": "^3.775.0",
     "@aws-sdk/s3-request-presigner": "^3.775.0",
     "cors": "^2.8.6",
-    "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.1",
     "helmet": "^8.3.0",

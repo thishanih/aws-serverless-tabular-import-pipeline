@@ -1,15 +1,12 @@
-# Excel Import Pipeline: 5-Million-Record CSV Processing Design
+# CSV Import Pipeline: 5-Million-Record Processing Design
 
-An AWS CDK application for importing `.xlsx` workbooks and `.csv` files into DynamoDB. It includes an Express API that creates presigned URLs for browser-based CSV uploads.
+An AWS CDK application for importing `.csv` files into DynamoDB. It includes an Express API that creates presigned URLs for browser-based CSV uploads.
 
 ## Import Paths
 
-- **XLSX:** S3 upload event -> Step Functions -> workbook loader -> validation and persistence SQS queues -> DynamoDB.
 - **CSV:** S3 upload event -> Step Functions Distributed Map -> batched CSV validation and persistence -> DynamoDB.
 
-Both paths validate records against the shared Zod schema. Invalid XLSX rows are stored in DynamoDB; invalid CSV rows are written to private error files in S3. Completion summaries are sent through Amazon SES.
-
-The XLSX loader buffers the workbook in Lambda memory. The CSV path reads rows from S3 in bounded batches and is intended for larger files. The configured five-million-row CSV target has **not been load-tested** and is not a production throughput guarantee.
+CSV records are validated against the shared Zod schema. Invalid rows are written to private error files in S3, and completion summaries are sent through Amazon SES. The configured five-million-row CSV target has **not been load-tested** and is not a production throughput guarantee.
 
 ## Documentation
 
@@ -59,7 +56,7 @@ export UPLOADS_BUCKET=UPLOAD_BUCKET_NAME
 npm run dev
 ```
 
-A successful `PUT` to the upload bucket starts the import automatically through the S3 object-created notification. The browser upload flow supports CSV files; upload XLSX files directly to S3 or use another S3 upload client.
+A successful `PUT` to the upload bucket starts the import automatically through the S3 object-created notification. Only `.csv` objects are processed.
 
 ## Input Format and Validation
 
@@ -69,7 +66,7 @@ The first row must contain these columns:
 name,email,contact number,address
 ```
 
-CSV header names are trimmed and compared without regard to case. XLSX processing reads the first worksheet and applies the same header normalization.
+CSV header names are trimmed and compared without regard to case.
 
 Validation rules:
 
@@ -102,15 +99,13 @@ aws s3 cp ./records.csv s3://UPLOAD_BUCKET_NAME/records.csv \
   --profile excel-import-dev
 ```
 
-Use a lowercase `.csv` or `.xlsx` suffix so the S3 notification routes the object to the workflow.
+Use a lowercase `.csv` suffix so the S3 notification routes the object to the workflow. Other file types do not start an import.
 
 ## CSV Capacity and Operational Notes
 
 The CSV Distributed Map is configured for up to 1,000 rows or 128 KiB per batch, with maximum concurrency of 100. Each CSV object must be no larger than the Step Functions S3 ItemReader limit of 10 GB. The five-million-row target has not been load-tested; test with representative files and monitor duration, failures, throttling, and cost before production use.
 
 Records are stored as individual DynamoDB items. Invalid CSV rows are stored as per-chunk CSV files in the private reports bucket, and the completion email links to a manifest. Downloading the report files requires AWS access to that bucket.
-
-For XLSX files, a successful Step Functions execution means the workbook loader finished and queued rows. Validation and persistence continue asynchronously through SQS, so check the job status and queues separately.
 
 The S3 buckets and DynamoDB tables use retain policies. Destroying the CDK stack does not automatically delete those resources or their data. Review retention, access, monitoring, and recovery procedures before production use.
 

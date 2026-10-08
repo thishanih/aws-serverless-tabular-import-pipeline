@@ -27,5 +27,5 @@ app.use("/uploads", uploadRoutes);
 app.use(errorHandler);
 
 app.listen(port, () => {
-  console.log(`Excel-to-JSON API listening on http://localhost:${port}`);
+  console.log(`CSV import API listening on http://localhost:${port}`);
 });
